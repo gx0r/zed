@@ -147,6 +147,9 @@ http_client = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 reqwest_client = { workspace = true, features = ["test-support"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc.workspace = true
+
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen = { workspace = true }
 web-sys = { version = "0.3", features = ["console"] }
@@ -260,3 +263,7 @@ path = "examples/a11y.rs"
 [[example]]
 name = "view_example"
 path = "examples/view_example/view_example_main.rs"
+
+[[example]]
+name = "native_layer_video_player"
+path = "examples/native_layer_video_player.rs"
