@@ -792,6 +792,8 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// Native layers that were rendered this frame (used for auto-hide)
+    pub(crate) rendered_native_layers: FxHashSet<crate::NativeLayerId>,
 }
 
 #[derive(Clone, Default)]
@@ -841,6 +843,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            rendered_native_layers: FxHashSet::default(),
         }
     }
 
@@ -857,6 +860,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.rendered_native_layers.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1000,6 +1004,13 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    /// Cached bounds for native layers, used for coordinate conversion
+    native_layer_bounds: FxHashMap<crate::NativeLayerId, Bounds<Pixels>>,
+    /// Cached configs for native layers, used by NativeLayerElement for declarative updates
+    native_layer_configs: FxHashMap<crate::NativeLayerId, crate::NativeLayerConfig>,
+    /// Callbacks invoked when native layer bounds change
+    native_layer_bounds_callbacks:
+        FxHashMap<crate::NativeLayerId, Box<dyn Fn(Bounds<Pixels>) + 'static>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
 }
@@ -1607,6 +1618,9 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            native_layer_bounds: FxHashMap::default(),
+            native_layer_configs: FxHashMap::default(),
+            native_layer_bounds_callbacks: FxHashMap::default(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
         })
@@ -2468,6 +2482,9 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+
+        // Auto-hide native layers that weren't rendered last frame
+        self.reconcile_native_layer_visibility();
 
         // Restore the previously-used input handler.
         if let Some(input_handler) = self.platform_window.take_input_handler() {
@@ -3834,6 +3851,202 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Add a native CALayer to the window as a sublayer.
+    ///
+    /// This method allows embedding platform-native layers (e.g., AVPlayerLayer for video)
+    /// within a GPUI window. The layer will be added as a sublayer of the window's content view.
+    ///
+    /// The `layer_ptr` should be a raw pointer to a CALayer (`*mut c_void`).
+    /// Returns a `NativeLayerId` that can be used to update or remove the layer.
+    ///
+    /// # Platform Support
+    ///
+    /// Currently only implemented on macOS. On other platforms, this method returns
+    /// a placeholder ID and has no effect.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::ffi::c_void;
+    ///
+    /// let layer_id = window.add_native_layer(
+    ///     av_player_layer.as_ptr() as *mut c_void,
+    ///     NativeLayerConfig {
+    ///         z_order: NativeLayerZOrder::BelowContent,
+    ///         ..Default::default()
+    ///     },
+    /// );
+    /// ```
+    pub fn add_native_layer(
+        &mut self,
+        layer_ptr: *mut std::ffi::c_void,
+        config: crate::NativeLayerConfig,
+    ) -> crate::NativeLayerId {
+        let id = self.platform_window.add_native_layer(layer_ptr, config.clone());
+        self.native_layer_configs.insert(id, config);
+        id
+    }
+
+    /// Remove a native layer from the window.
+    ///
+    /// The layer will be detached from its superlayer.
+    pub fn remove_native_layer(&mut self, id: crate::NativeLayerId) {
+        self.native_layer_bounds.remove(&id);
+        self.native_layer_configs.remove(&id);
+        self.native_layer_bounds_callbacks.remove(&id);
+        self.platform_window.remove_native_layer(id);
+    }
+
+    /// Update the bounds of a native layer.
+    ///
+    /// Bounds are specified in GPUI coordinates (top-left origin, logical pixels).
+    /// The coordinate conversion to the platform's native system is handled automatically.
+    ///
+    /// This should typically be called during the paint phase to keep the native layer
+    /// synchronized with GPUI's layout.
+    pub fn update_native_layer_bounds(&mut self, id: crate::NativeLayerId, bounds: Bounds<Pixels>) {
+        let changed = self.native_layer_bounds.get(&id) != Some(&bounds);
+        self.native_layer_bounds.insert(id, bounds);
+        self.platform_window.update_native_layer_bounds(id, bounds);
+
+        // Invoke bounds change callback if bounds actually changed
+        if changed {
+            if let Some(callback) = self.native_layer_bounds_callbacks.get(&id) {
+                callback(bounds);
+            }
+        }
+    }
+
+    /// Convert window coordinates to native layer-local coordinates.
+    ///
+    /// This is useful for hit-testing content rendered within a native layer.
+    /// The returned coordinates use the native layer's coordinate system
+    /// (bottom-left origin on macOS, matching CALayer coordinates).
+    ///
+    /// Returns `None` if the layer doesn't exist or the position is outside layer bounds.
+    pub fn native_layer_point(
+        &self,
+        layer_id: crate::NativeLayerId,
+        window_position: Point<Pixels>,
+    ) -> Option<Point<Pixels>> {
+        let bounds = self.native_layer_bounds.get(&layer_id)?;
+
+        // Check if position is within layer bounds
+        if !bounds.contains(&window_position) {
+            return None;
+        }
+
+        // Convert to layer-local coordinates
+        // X is straightforward subtraction
+        let local_x = window_position.x - bounds.origin.x;
+
+        // Y needs to be flipped for native layers (bottom-left origin on macOS)
+        // In GPUI: y=0 is top, increases downward
+        // In native layer: y=0 is bottom, increases upward
+        let local_y = bounds.size.height - (window_position.y - bounds.origin.y);
+
+        Some(point(local_x, local_y))
+    }
+
+    /// Update the configuration of a native layer.
+    ///
+    /// This allows changing the z-order, visibility, and opacity of a native layer
+    /// after it has been added.
+    pub fn update_native_layer_config(
+        &mut self,
+        id: crate::NativeLayerId,
+        config: crate::NativeLayerConfig,
+    ) {
+        self.native_layer_configs.insert(id, config.clone());
+        self.platform_window.update_native_layer_config(id, config);
+    }
+
+    /// Get the current configuration of a native layer.
+    ///
+    /// Returns the default config if the layer doesn't exist.
+    pub fn get_native_layer_config(&self, id: crate::NativeLayerId) -> crate::NativeLayerConfig {
+        self.native_layer_configs
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set a callback to be invoked when a native layer's bounds change.
+    ///
+    /// The callback receives the new bounds in GPUI coordinates. This is useful
+    /// for updating overlay content that needs to stay synchronized with the
+    /// native layer's position.
+    ///
+    /// Pass `None` to remove an existing callback.
+    pub fn set_native_layer_bounds_callback(
+        &mut self,
+        id: crate::NativeLayerId,
+        callback: Option<impl Fn(Bounds<Pixels>) + 'static>,
+    ) {
+        if let Some(cb) = callback {
+            self.native_layer_bounds_callbacks.insert(id, Box::new(cb));
+        } else {
+            self.native_layer_bounds_callbacks.remove(&id);
+        }
+    }
+
+    /// Mark a native layer as rendered this frame.
+    ///
+    /// Called by `NativeLayerElement::paint()`. Layers not marked as rendered
+    /// will be automatically hidden at the start of the next frame.
+    pub fn mark_native_layer_rendered(&mut self, id: crate::NativeLayerId) {
+        self.next_frame.rendered_native_layers.insert(id);
+    }
+
+    /// Reconcile native layer visibility based on render tree participation.
+    ///
+    /// Layers that were rendered last frame stay visible (unless explicitly hidden).
+    /// Layers that weren't rendered get automatically hidden.
+    ///
+    /// Layers with `manual_visibility: true` are skipped - their visibility is
+    /// managed entirely through explicit `update_native_layer_config` calls.
+    fn reconcile_native_layer_visibility(&mut self) {
+        // Early exit if no native layers exist
+        if self.native_layer_configs.is_empty() {
+            return;
+        }
+
+        let rendered_last_frame = &self.rendered_frame.rendered_native_layers;
+
+        // Collect updates to avoid borrow issues
+        let updates: Vec<_> = self
+            .native_layer_configs
+            .iter()
+            .filter_map(|(layer_id, config)| {
+                // Skip layers with manual visibility control
+                if config.manual_visibility {
+                    return None;
+                }
+
+                let was_rendered = rendered_last_frame.contains(layer_id);
+                // If not rendered, should be hidden (unless already hidden)
+                if !was_rendered && !config.hidden {
+                    Some((*layer_id, true)) // hide it
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Apply visibility updates
+        for (layer_id, should_hide) in updates {
+            if let Some(config) = self.native_layer_configs.get(&layer_id) {
+                let new_config = crate::NativeLayerConfig {
+                    hidden: should_hide,
+                    ..config.clone()
+                };
+                self.native_layer_configs.insert(layer_id, new_config.clone());
+                self.platform_window
+                    .update_native_layer_config(layer_id, new_config);
+            }
+        }
     }
 
     /// Removes an image from the sprite atlas.

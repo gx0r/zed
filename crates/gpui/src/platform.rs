@@ -583,6 +583,61 @@ impl Tiling {
     }
 }
 
+/// Identifier for a native layer managed by GPUI.
+///
+/// Native layers are platform-specific sublayers (e.g., CALayer on macOS)
+/// that can be embedded within a GPUI window. This allows rendering content
+/// like video (via AVPlayerLayer) alongside GPUI's UI.
+///
+/// # Platform Support
+///
+/// Currently only implemented on macOS. On other platforms, the API is
+/// available but has no effect. Future implementations could use:
+/// - Windows: DirectComposition layers (Windows' compositing API similar to CALayer) or child HWNDs (create a child window and position it, z-order quirks)
+/// - Linux/Wayland: Subsurfaces
+/// - Linux/X11: XEmbed or compositing
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct NativeLayerId(pub u64);
+
+/// Z-order for native layers relative to GPUI content.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum NativeLayerZOrder {
+    /// Layer renders below all GPUI content (z = -1000.0 - index)
+    #[default]
+    BelowContent,
+    /// Layer renders above all GPUI content (z = 1000.0 + index)
+    AboveContent,
+    /// Custom z-position (negative = below GPUI, positive = above)
+    Custom(f32),
+}
+
+/// Configuration for a native layer.
+#[derive(Clone, Debug)]
+pub struct NativeLayerConfig {
+    /// Z-order relative to GPUI content
+    pub z_order: NativeLayerZOrder,
+    /// Whether the layer is hidden
+    pub hidden: bool,
+    /// Opacity (0.0 to 1.0)
+    pub opacity: f32,
+    /// If true, visibility is managed manually via `update_native_layer_config` only.
+    /// The layer won't be auto-hidden when its element isn't rendered, and won't be
+    /// auto-shown when its element is rendered. Use this when you need full control
+    /// over layer visibility independent of the render tree.
+    pub manual_visibility: bool,
+}
+
+impl Default for NativeLayerConfig {
+    fn default() -> Self {
+        Self {
+            z_order: NativeLayerZOrder::default(),
+            hidden: false,
+            opacity: 1.0,
+            manual_visibility: false,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 #[expect(missing_docs)]
 pub struct RequestFrameOptions {
@@ -704,6 +759,30 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+
+    // Native layer support (macOS CALayer embedding)
+
+    /// Add a native CALayer to the window as a sublayer.
+    /// The layer_ptr should be a raw pointer to a CALayer (*mut c_void).
+    /// Returns a NativeLayerId that can be used to update or remove the layer.
+    fn add_native_layer(
+        &mut self,
+        _layer_ptr: *mut std::ffi::c_void,
+        _config: NativeLayerConfig,
+    ) -> NativeLayerId {
+        NativeLayerId(0)
+    }
+
+    /// Remove a native layer from the window.
+    fn remove_native_layer(&mut self, _id: NativeLayerId) {}
+
+    /// Update the bounds of a native layer.
+    /// Bounds are in GPUI coordinates (top-left origin, logical pixels).
+    /// The platform implementation handles coordinate conversion.
+    fn update_native_layer_bounds(&mut self, _id: NativeLayerId, _bounds: Bounds<Pixels>) {}
+
+    /// Update the configuration of a native layer.
+    fn update_native_layer_config(&mut self, _id: NativeLayerId, _config: NativeLayerConfig) {}
 }
 
 /// A renderer for headless windows that can produce real rendered output.

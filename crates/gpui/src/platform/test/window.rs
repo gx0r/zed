@@ -1,9 +1,9 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    DispatchEventResult, GpuSpecs, NativeLayerConfig, NativeLayerId, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use image::RgbaImage;
@@ -34,6 +34,8 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    native_layers: HashMap<NativeLayerId, (Bounds<Pixels>, NativeLayerConfig)>,
+    next_native_layer_id: u64,
 }
 
 #[derive(Clone)]
@@ -86,6 +88,8 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            native_layers: HashMap::default(),
+            next_native_layer_id: 1,
         })))
     }
 
@@ -331,6 +335,34 @@ impl PlatformWindow for TestWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
+    }
+
+    fn add_native_layer(
+        &mut self,
+        _layer_ptr: *mut std::ffi::c_void,
+        config: NativeLayerConfig,
+    ) -> NativeLayerId {
+        let mut state = self.0.lock();
+        let id = NativeLayerId(state.next_native_layer_id);
+        state.next_native_layer_id += 1;
+        state.native_layers.insert(id, (Bounds::default(), config));
+        id
+    }
+
+    fn remove_native_layer(&mut self, id: NativeLayerId) {
+        self.0.lock().native_layers.remove(&id);
+    }
+
+    fn update_native_layer_bounds(&mut self, id: NativeLayerId, bounds: Bounds<Pixels>) {
+        if let Some((stored_bounds, _)) = self.0.lock().native_layers.get_mut(&id) {
+            *stored_bounds = bounds;
+        }
+    }
+
+    fn update_native_layer_config(&mut self, id: NativeLayerId, config: NativeLayerConfig) {
+        if let Some((_, stored_config)) = self.0.lock().native_layers.get_mut(&id) {
+            *stored_config = config;
+        }
     }
 }
 

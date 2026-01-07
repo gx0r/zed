@@ -4,6 +4,7 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
+use collections::FxHashMap;
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -27,11 +28,11 @@ use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ExternalPaths, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
-    px, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NativeLayerConfig, NativeLayerId,
+    NativeLayerZOrder, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size,
+    SystemWindowTab, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -421,6 +422,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
     }
 }
 
+struct NativeLayerState {
+    layer_ptr: id,
+    config: NativeLayerConfig,
+}
+
 struct MacWindowState {
     handle: AnyWindowHandle,
     foreground_executor: ForegroundExecutor,
@@ -460,6 +466,11 @@ struct MacWindowState {
     closed: Arc<AtomicBool>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    // Native layer support
+    native_layers: FxHashMap<NativeLayerId, NativeLayerState>,
+    next_native_layer_id: u64,
+    // Container layer that holds both metal and native layers for proper z-ordering
+    container_layer: id,
 }
 
 impl MacWindowState {
@@ -607,6 +618,28 @@ impl MacWindowState {
             WindowBounds::Windowed(self.bounds())
         }
     }
+
+    fn gpui_bounds_to_calayer_frame(&self, bounds: Bounds<Pixels>) -> CGRect {
+        let content_size = self.content_size();
+        CGRect::new(
+            &CGPoint::new(
+                bounds.origin.x.as_f32() as f64,
+                (content_size.height - bounds.origin.y - bounds.size.height).as_f32() as f64,
+            ),
+            &core_graphics::display::CGSize::new(
+                bounds.size.width.as_f32() as f64,
+                bounds.size.height.as_f32() as f64,
+            ),
+        )
+    }
+
+    fn z_position_for_native_layer(&self, z_order: NativeLayerZOrder, index: usize) -> f64 {
+        match z_order {
+            NativeLayerZOrder::BelowContent => -1000.0 - index as f64,
+            NativeLayerZOrder::AboveContent => 1000.0 + index as f64,
+            NativeLayerZOrder::Custom(z) => z as f64,
+        }
+    }
 }
 
 unsafe impl Send for MacWindowState {}
@@ -738,6 +771,27 @@ impl MacWindow {
             let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
 
+            // Create renderer first so we can set up layer hierarchy
+            let renderer = renderer::new_renderer(
+                renderer_context,
+                native_window as *mut _,
+                native_view as *mut _,
+                bounds.size.map(|pixels| pixels.as_f32()),
+                false,
+            );
+
+            // Create a container layer that will hold both the metal layer and native layers.
+            // This allows proper z-ordering: native layers with BelowContent z-order (-1000)
+            // will render behind the metal layer (z=0), enabling video to appear behind UI.
+            let container_layer: id = msg_send![class!(CALayer), layer];
+            let _: () = msg_send![container_layer, retain];
+            let metal_layer = renderer.layer_ptr() as id;
+            let _: () = msg_send![metal_layer, setZPosition: 0.0f64];
+            // kCALayerWidthSizable (0x02) | kCALayerHeightSizable (0x10) = 0x12
+            // This makes the metal layer auto-resize with the container layer
+            let _: () = msg_send![metal_layer, setAutoresizingMask: 0x12u32];
+            let _: () = msg_send![container_layer, addSublayer: metal_layer];
+
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
                 handle,
                 foreground_executor,
@@ -747,13 +801,7 @@ impl MacWindow {
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 display_link: None,
-                renderer: renderer::new_renderer(
-                    renderer_context,
-                    native_window as *mut _,
-                    native_view as *mut _,
-                    bounds.size.map(|pixels| pixels.as_f32()),
-                    false,
-                ),
+                renderer,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -785,6 +833,9 @@ impl MacWindow {
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
                 sheet_parent: None,
+                native_layers: FxHashMap::default(),
+                next_native_layer_id: 1,
+                container_layer,
             })));
 
             (*native_window).set_ivar(
@@ -1695,6 +1746,74 @@ impl PlatformWindow for MacWindow {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
     }
+
+    fn add_native_layer(
+        &mut self,
+        layer_ptr: *mut c_void,
+        config: NativeLayerConfig,
+    ) -> NativeLayerId {
+        let mut this = self.0.lock();
+        let id = NativeLayerId(this.next_native_layer_id);
+        this.next_native_layer_id += 1;
+
+        let layer = layer_ptr as id;
+        let z_pos = this.z_position_for_native_layer(config.z_order, this.native_layers.len());
+
+        unsafe {
+            let native_view = this.native_view.as_ptr();
+            let _: () = msg_send![native_view, setWantsLayer: YES];
+
+            let view_layer: id = msg_send![native_view, layer];
+            if !view_layer.is_null() {
+                let _: () = msg_send![layer, setZPosition: z_pos];
+                let _: () = msg_send![layer, setHidden: config.hidden as BOOL];
+                let _: () = msg_send![layer, setOpacity: config.opacity];
+                let _: () = msg_send![view_layer, addSublayer: layer];
+            }
+        }
+
+        this.native_layers.insert(
+            id,
+            NativeLayerState {
+                layer_ptr: layer,
+                config,
+            },
+        );
+
+        id
+    }
+
+    fn remove_native_layer(&mut self, id: NativeLayerId) {
+        let mut this = self.0.lock();
+        if let Some(state) = this.native_layers.remove(&id) {
+            unsafe {
+                let _: () = msg_send![state.layer_ptr, removeFromSuperlayer];
+            }
+        }
+    }
+
+    fn update_native_layer_bounds(&mut self, id: NativeLayerId, bounds: Bounds<Pixels>) {
+        let this = self.0.lock();
+        let frame = this.gpui_bounds_to_calayer_frame(bounds);
+        if let Some(state) = this.native_layers.get(&id) {
+            unsafe {
+                let _: () = msg_send![state.layer_ptr, setFrame: frame];
+            }
+        }
+    }
+
+    fn update_native_layer_config(&mut self, id: NativeLayerId, config: NativeLayerConfig) {
+        let mut this = self.0.lock();
+        let z_pos = this.z_position_for_native_layer(config.z_order, 0);
+        if let Some(state) = this.native_layers.get_mut(&id) {
+            unsafe {
+                let _: () = msg_send![state.layer_ptr, setZPosition: z_pos];
+                let _: () = msg_send![state.layer_ptr, setHidden: config.hidden as BOOL];
+                let _: () = msg_send![state.layer_ptr, setOpacity: config.opacity];
+            }
+            state.config = config;
+        }
+    }
 }
 
 impl rwh::HasWindowHandle for MacWindow {
@@ -2314,7 +2433,9 @@ extern "C" fn close_window(this: &Object, _: Sel) {
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
     let window_state = unsafe { get_window_state(this) };
     let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    // Return the container layer which holds both the metal layer (at z=0)
+    // and any native layers (which can be at negative z for BelowContent)
+    window_state.container_layer
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {

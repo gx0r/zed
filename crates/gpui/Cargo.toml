@@ -247,3 +247,7 @@ path = "examples/list_example.rs"
 [[example]]
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
+
+[[example]]
+name = "video_player"
+path = "examples/video_player.rs"
