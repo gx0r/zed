@@ -16,8 +16,12 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    },
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -1407,10 +1411,12 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
+            let pixel_format = surface.image_buffer.get_pixel_format();
+            if pixel_format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                && pixel_format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            {
+                panic!("Unsupported pixel format: {}", pixel_format);
+            }
 
             let y_texture = self
                 .core_video_texture_cache

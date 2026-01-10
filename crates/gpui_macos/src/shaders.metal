@@ -874,14 +874,18 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> cb_cr_texture
                                  [[texture(SurfaceInputIndex_CbCrTexture)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+
+  // VideoToolbox outputs full-range YCbCr data regardless of 420f/420v format
+  float4 ycbcr = float4(
+      y_texture.sample(texture_sampler, input.texture_position).r,
+      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+
+  // BT.601 YCbCr to RGB matrix
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
                float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
                float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
                float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
-  float4 ycbcr = float4(
-      y_texture.sample(texture_sampler, input.texture_position).r,
-      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
   return ycbcrToRGBTransform * ycbcr;
 }
